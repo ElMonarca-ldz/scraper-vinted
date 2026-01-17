@@ -1,4 +1,4 @@
-FROM python:3.10-slim
+FROM python:3.10-bookworm
 
 # Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1
@@ -7,23 +7,23 @@ ENV PYTHONUNBUFFERED=1
 # Set work directory
 WORKDIR /app
 
-# Install system dependencies required for Playwright
-# We need to install the deps before playwright install to ensure they are available
-# actually 'playwright install-deps' handles this but it needs some base tools
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
     curl \
     && rm -rf /var/lib/apt/lists/*
+
 # Copy requirements
 COPY requirements.txt .
 
 # Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Install Playwright browsers and dependencies
-# This is crucial: install-deps installs OS-level libraries
-RUN playwright install --with-deps chromium
+# Install Playwright dependencies first, then browsers
+# We use install-deps separately to handle OS libraries properly
+RUN playwright install-deps chromium
+RUN playwright install chromium
 
 # Copy project files
 COPY . .
