@@ -25,9 +25,6 @@ DATABASE_URL = f"sqlite:///{DB_PATH}"
 
 Base = declarative_base()
 
-    def __repr__(self):
-        return f"<SearchConfig(term='{self.term}')>"
-
 class ScraperLog(Base):
     __tablename__ = 'scraper_logs'
     
