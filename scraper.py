@@ -13,7 +13,7 @@ from datetime import datetime
 from database import SessionLocal, ScraperLog, Config
 
 # Logging setup - also log to DB
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
 
 def log_to_db(message, level="INFO"):
     """Writes log message to SQLite so Streamlit can read it."""
@@ -328,10 +328,11 @@ def fetch_vinted_brands(keyword=""):
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         # Use a context to keep cookies if needed, or just new page
-        page = browser.new_context(
+        context = browser.new_context(
             user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
             locale="es-ES"
         )
+        page = context.new_page()
         
         try:
             # Vinted hidden API for brands usually accessed via:

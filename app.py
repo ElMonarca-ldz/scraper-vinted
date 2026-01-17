@@ -394,10 +394,27 @@ elif mode == "🛠️ Configuración":
             db.close()
 
 elif mode == "🔍 Logs":
-    st.header("Logs en Vivo")
-    if st.button("Refresh"): st.rerun()
+    st.header("Consola de Sistema")
+    st.info("Visualiza los logs en tiempo real (similar a CMD).")
+    
+    col1, col2 = st.columns([8, 2])
+    limit = col2.number_input("Mostrar", 10, 500, 100)
+    if col1.button("🔄 Actualizar Consola"): st.rerun()
+    
     db = next(get_db())
-    logs = db.query(ScraperLog).order_by(ScraperLog.timestamp.desc()).limit(50).all()
-    for l in logs:
-        st.caption(f"{l.timestamp.strftime('%H:%M:%S')} - {l.message}")
+    logs = db.query(ScraperLog).order_by(ScraperLog.timestamp.desc()).limit(limit).all()
+    
+    if logs:
+        # Format logs as a single string block
+        log_lines = []
+        for l in logs:
+            # Reconstruct the format requested: 2026-01-17 16:24:15,170 - INFO - Message
+            # We don't have ms in DB by default, but we can simulate/show timestamp
+            ts = l.timestamp.strftime('%Y-%m-%d %H:%M:%S')
+            line = f"{ts} - {l.level} - {l.message}"
+            log_lines.append(line)
+        
+        st.code("\n".join(log_lines), language="bash")
+    else:
+        st.write("No hay logs registrados.")
     db.close()
