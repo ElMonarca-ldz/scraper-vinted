@@ -14,7 +14,13 @@ from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy.orm import Session
 import logging
 import os
+import sys
+import asyncio
 from io import BytesIO
+
+# Fix for Windows asyncio loop (NotImplementedError in Playwright)
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
 
 from database import get_db, init_db, SearchConfig, Product, ScraperLog, Config, PriceHistory, Brand, AlertRule
 from scraper import scrape_vinted, VINTED_SIZE_IDS, VINTED_CONDITION_IDS, VINTED_COLOR_IDS, VINTED_CATALOG_IDS, send_telegram_alert, download_image_as_avif, verify_sold_status, fetch_vinted_brands
