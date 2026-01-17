@@ -202,25 +202,8 @@ def scrape_vinted(search_config):
 
             time.sleep(random.uniform(2, 4)) 
             
-            # --- ROBUST PARSING STRATEGY (Bug Fix) ---
-            # Vinted grid items usually have a specific structure.
-            # Instead of relying on index (p[0], p[1]), we look for classes or attributes.
-            
-            page.wait_for_selector('div[data-testid="grid-item"]', timeout=15000)
-            items = page.query_selector_all('div[data-testid="grid-item"]')
-            log_to_db(f"Encontrados {len(items)} items.", "INFO")
-            
-            for item in items[:20]: 
-                try:
-                    product_data = {}
-                    
-                    # 1. URL & Title (Anchor tag is usually the main wrapper or big link)
-                    link_elem = item.query_selector('a[href*="/items/"]') # More specific selector
-                    if not link_elem:
-                        link_elem = item.query_selector('a') # Fallback
-                        
-                    if not link_elem: continue
             # --- PARSING AND PAGINATION ---
+
             page_idx = 1
             total_items = 0
             
