@@ -1,0 +1,7 @@
+streamlit==1.30.0
+playwright==1.41.0
+pandas==2.2.0
+sqlalchemy==2.0.25
+apscheduler==3.10.4
+watchdog==3.0.0
+openpyxl
