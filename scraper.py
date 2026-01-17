@@ -311,8 +311,8 @@ def scrape_vinted(search_config):
             
             browser.close()
             
-    except Exception as e:
-        log_to_db(f"Error crítico en scraper: {e}", "ERROR")
+        except Exception as e:
+            log_to_db(f"Error crítico en scraper: {e}", "ERROR")
 
     log_to_db(f"Búsqueda finalizada. {len(results)} items extraídos.", "INFO")
     return results
