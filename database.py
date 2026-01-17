@@ -53,6 +53,25 @@ class Config(Base):
     key = Column(String, unique=True)
     value = Column(String)
 
+class Brand(Base):
+    __tablename__ = 'brands'
+    
+    id = Column(Integer, primary_key=True)
+    vinted_id = Column(String, unique=True)
+    title = Column(String)
+    is_favorite = Column(Integer, default=0) # 0=No, 1=Yes
+
+class AlertRule(Base):
+    __tablename__ = 'alert_rules'
+    
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    brand_list = Column(String, nullable=True) # Comma separated names
+    max_price = Column(Float, nullable=True)
+    min_discount_percent = Column(Float, nullable=True) # % below fair price
+    min_z_score = Column(Float, nullable=True) # e.g. -1.5
+    is_active = Column(Integer, default=1)
+
 class SearchConfig(Base):
     __tablename__ = 'search_configs'
     

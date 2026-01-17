@@ -7,3 +7,4 @@ watchdog==3.0.0
 requests
 Pillow==10.2.0
 pillow-avif-plugin==1.4.3
+openpyxl

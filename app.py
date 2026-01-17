@@ -8,18 +8,19 @@ import logging
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 from datetime import datetime, timedelta
 from apscheduler.schedulers.background import BackgroundScheduler
 from sqlalchemy.orm import Session
-import threading
 import logging
 import os
+from io import BytesIO
 
-from database import get_db, init_db, SearchConfig, Product, engine, ScraperLog, Config, PriceHistory
-from scraper import scrape_vinted, VINTED_SIZE_IDS, VINTED_CONDITION_IDS, VINTED_COLOR_IDS, VINTED_CATALOG_IDS, send_telegram_alert, download_image_as_avif, verify_sold_status
+from database import get_db, init_db, SearchConfig, Product, ScraperLog, Config, PriceHistory, Brand, AlertRule
+from scraper import scrape_vinted, VINTED_SIZE_IDS, VINTED_CONDITION_IDS, VINTED_COLOR_IDS, VINTED_CATALOG_IDS, send_telegram_alert, download_image_as_avif, verify_sold_status, fetch_vinted_brands
 
 # --- CONFIGURATION ---
-st.set_page_config(page_title="Scraper Vinted Pro", layout="wide", page_icon="⚡")
+st.set_page_config(page_title="Vinted Pro Analytics", layout="wide", page_icon="📈")
 
 # Initialize DB
 init_db()
@@ -30,94 +31,97 @@ if 'scheduler' not in st.session_state:
     st.session_state.scheduler.start()
     logging.info("Scheduler started.")
 
-# Dynamic Job Management
 def update_scheduler_job(db: Session):
     scheduler = st.session_state.scheduler
-    # Remove existing
-    if scheduler.get_job('main_scan'):
-        scheduler.remove_job('main_scan')
-    if scheduler.get_job('sold_check'):
-        scheduler.remove_job('sold_check')
+    if scheduler.get_job('main_scan'): scheduler.remove_job('main_scan')
+    if scheduler.get_job('sold_check'): scheduler.remove_job('sold_check')
         
-    # Get settings
     active_setting = db.query(Config).filter_by(key="scheduler_active").first()
     interval_setting = db.query(Config).filter_by(key="scheduler_interval").first()
-    
     is_active = active_setting.value == "1" if active_setting else True
     interval = int(interval_setting.value) if interval_setting else 6
     
     if is_active:
         scheduler.add_job(run_scheduled_scans, 'interval', hours=interval, id='main_scan')
-        # Sold check runs every 24h by default, or 2x interval
         scheduler.add_job(run_sold_check_job, 'interval', hours=24, id='sold_check')
-        logging.info(f"Scheduler updated: Active={is_active}, ScanInterval={interval}h")
-    else:
-        logging.info("Scheduler paused.")
 
 def run_scheduled_scans():
-    logging.info("Starting scheduled scan...")
     db = next(get_db())
     configs = db.query(SearchConfig).all()
     for config in configs:
         scrape_and_save(db, config)
     db.close()
-    logging.info("Scan completed.")
 
 def run_sold_check_job():
-    logging.info("Starting Sold Status Check...")
     db = next(get_db())
-    # Check last 50 scanned items that are NOT sold
-    products = db.query(Product).filter(Product.is_sold == 0).order_by(Product.scanned_at.desc()).limit(50).all()
-    
+    products = db.query(Product).filter(Product.is_sold == 0).order_by(Product.scanned_at.desc()).limit(100).all()
     for p in products:
         status = verify_sold_status(p.url)
         if status == 'sold':
             p.is_sold = 1
             p.sold_at = datetime.utcnow()
-            logging.info(f"Item marked as SOLD: {p.title}")
         elif status == 'deleted':
-            # Option: Mark as sold or delete? Let's mark as sold/inactive
-            p.is_sold = 1 
-            logging.info(f"Item DELETED: {p.title}")
-            
+            p.is_sold = 1
     db.commit()
     db.close()
-    logging.info("Sold Status Check completed.")
 
-# Ensure job exists on startup
 if not st.session_state.scheduler.get_jobs():
-    # Default fallback
     st.session_state.scheduler.add_job(run_scheduled_scans, 'interval', hours=6, id='main_scan')
     st.session_state.scheduler.add_job(run_sold_check_job, 'interval', hours=24, id='sold_check')
+    
+# --- ANALYTICS ENGINE ---
 
-# --- LOGIC ---
+def calculate_stats(prices):
+    if not prices: return 0, 0
+    arr = np.array(prices)
+    return np.mean(arr), np.std(arr)
 
-def get_fair_price(db, term):
-    # Calculate avg price of last 50 items for this term
-    # This is a heuristic approximation
-    # Ideally filtering by product_id if price history exists, but term-based is good enough for broad view
-    stmt = f"SELECT AVG(price) FROM products JOIN search_configs ON products.search_config_id = search_configs.id WHERE search_configs.term = '{term}'"
-    # Simplified SQL alchemy approach
-    # Getting all products for term is easier
-    products = db.query(Product).join(SearchConfig).filter(SearchConfig.term == term).limit(50).all()
-    if not products: return 0.0
-    return sum([p.price for p in products]) / len(products)
+def check_global_alerts(db, product):
+    """
+    Checks if a product matches any active AlertRule.
+    """
+    rules = db.query(AlertRule).filter_by(is_active=1).all()
+    for rule in rules:
+        # Check Brand
+        if rule.brand_list:
+            if not product.brand or product.brand.lower() not in [b.lower().strip() for b in rule.brand_list.split(',')]:
+                continue
+        
+        # Check Price
+        if rule.max_price is not None and product.price > rule.max_price:
+            continue
+            
+        # Check Z-Score (Complex)
+        if rule.min_z_score is not None:
+             # Need context stats
+             ph = db.query(PriceHistory).filter(PriceHistory.product_id == product.id).all() # This is only for this product
+             # We need stats for the SEARCH TERM usually
+             # Approximate with current price vs search config average?
+             # Let's use the scrape_and_save pre-calculated stats for now or skip if complex
+             pass 
+
+        # If we get here, Match!
+        send_telegram_alert(f"🚨 **ALERTA: {rule.name}**\n\n{product.title}\n{product.price}€\nURL: {product.url}")
 
 def scrape_and_save(db, config):
     results = scrape_vinted(config)
     new_count = 0
-    fair_price = get_fair_price(db, config.term) if config.term else 0
+    
+    # Get stats for Z-Score
+    # We look at all products for this search config to build a baseline
+    all_prices = [p.price for p in config.products]
+    hist_mean, hist_std = calculate_stats(all_prices)
     
     for item in results:
         existing = db.query(Product).filter_by(url=item['url']).first()
         
-        # Download Image
+        # Image
         local_img = None
         if item.get('image_url'):
-            # Fake ID generation for filename since we don't have DB ID yet
             temp_id = abs(hash(item['url'])) 
             local_img = download_image_as_avif(item['image_url'], temp_id)
             
+        p_obj = existing
         if not existing:
             new_product = Product(
                 search_config_id=config.id,
@@ -130,25 +134,27 @@ def scrape_and_save(db, config):
                 local_image_path=local_img
             )
             db.add(new_product)
-            db.commit() # Commit to get ID
+            db.commit()
+            p_obj = new_product
             
-            # Price History
-            ph = PriceHistory(product_id=new_product.id, price=item.get('price'))
-            db.add(ph)
-            
-            # DEAL DETECTION & ALERT
-            # Logic: If price < 70% of fair price AND fair_price > 0
-            if fair_price > 0 and item.get('price') < (fair_price * 0.7):
-                msg = f"🔥 *¡Oportunidad Detectada!*\n\nitem: {item.get('title')}\nPrecio: {item.get('price')}€ (Media: {fair_price:.2f}€)\nURL: {item.get('url')}"
-                send_telegram_alert(msg)
-                
+            # History
+            db.add(PriceHistory(product_id=p_obj.id, price=item.get('price')))
             new_count += 1
+            
+            # CHECK ALERTS
+            check_global_alerts(db, p_obj)
+            
+            # AUTO-Z-SCORE ALERT (Legacy)
+            if hist_mean > 0:
+                 z_score = (item.get('price') - hist_mean) / (hist_std if hist_std > 0 else 1)
+                 if z_score < -1.5: # 1.5 Sigma event
+                     send_telegram_alert(f"📉 **Oportunidad Estadística (Z={z_score:.1f})**\n\n{item.get('title')}\n{item.get('price')}€ (Avg: {hist_mean:.1f}€)")
+
         else:
-            # Update price if changed
+            # Price Update
             if abs(existing.price - item.get('price')) > 0.5:
                 existing.price = item.get('price')
-                ph = PriceHistory(product_id=existing.id, price=item.get('price'))
-                db.add(ph)
+                db.add(PriceHistory(product_id=existing.id, price=item.get('price')))
                 
     config.last_run = datetime.utcnow()
     db.commit()
@@ -156,177 +162,190 @@ def scrape_and_save(db, config):
 
 # --- UI ---
 
-st.title("⚡ Vinted Intelligence System")
+# Sidebar Navigation
+mode = st.sidebar.radio("Menú", ["📊 Dashboard", "📈 Análisis de Mercado", "🚨 Reglas y Alertas", "🛠️ Configuración", "🔍 Logs"])
 
-# Navigation
-page = st.sidebar.radio("Navegación", ["📊 Dashboard", "🛠️ Configuración", "🔍 Logs"])
-
-if page == "📊 Dashboard":
-    with st.sidebar.expander("➕ Nueva Búsqueda", expanded=True):
-        with st.form("add_search"):
-            term = st.text_input("Palabras Clave (o Marca)", placeholder="Nike Jordan 1")
+if mode == "📊 Dashboard":
+    st.header("Monitor de Oportunidades")
+    
+    # Add Search
+    with st.expander("➕ Nueva Búsqueda", expanded=True):
+        with st.form("new_search"):
+            st.info("Configura los parámetros para que el bot rastree Vinted.")
+            term = st.text_input("Término", help="Lo que escribirías en el buscador de Vinted")
             
-            # Advanced Filters
+            db = next(get_db())
+            # Brand Selector: Dynamic or Text
+            brands_db = db.query(Brand).order_by(Brand.title).all()
+            if brands_db:
+                brand_mode = st.radio("Selección de Marca", ["Escribir Manual", "Seleccionar de Lista"], horizontal=True)
+                if brand_mode == "Seleccionar de Lista":
+                    b_obj = st.selectbox("Marca", [b.title for b in brands_db])
+                    brand_val = b_obj
+                else:
+                    brand_val = st.text_input("Marca (Manual)")
+            else:
+                brand_val = st.text_input("Marca (Manual)", help="Sincroniza marcas en Configuración para ver una lista aquí.")
+            
             c1, c2 = st.columns(2)
-            brand_filter = c1.text_input("Marca (Específica)", placeholder="Jordan")
-            cat_list = list(VINTED_CATALOG_IDS.keys())
-            cats = c2.multiselect("Categoría", cat_list)
+            min_p = c1.number_input("Min €", 0.0)
+            max_p = c2.number_input("Max €", 0.0)
             
-            c3, c4 = st.columns(2)
-            min_p = c3.number_input("Min €", 0.0)
-            max_p = c4.number_input("Max €", 0.0)
-            
-            col_list = list(VINTED_COLOR_IDS.keys())
-            colors = st.multiselect("Colores", col_list)
-            
-            sizes = st.multiselect("Tallas", list(VINTED_SIZE_IDS.keys()))
-            conds = st.multiselect("Estado", list(VINTED_CONDITION_IDS.keys()))
-            
-            if st.form_submit_button("Guardar Rastreador"):
-                db = next(get_db())
-                # Concatenate IDs
-                cat_ids = ",".join(cats) if cats else None
-                col_ids = ",".join(colors) if colors else None
-                
-                nc = SearchConfig(
-                    term=term,
-                    brand_name=brand_filter,
-                    min_price=min_p, 
-                    max_price=max_p if max_p > 0 else None,
-                    sizes=",".join(sizes),
-                    condition=",".join(conds),
-                    color_ids=col_ids,
-                    catalog_ids=cat_ids
-                )
+            if st.form_submit_button("Guardar"):
+                nc = SearchConfig(term=term, brand_name=brand_val, min_price=min_p, max_price=max_p if max_p > 0 else None)
                 db.add(nc)
                 db.commit()
-                st.success("Rastreador guardado.")
-                db.close()
+                st.success("Guardado")
                 st.rerun()
-
-    # Active Trackers
-    st.subheader("Rastreadores Activos")
+            db.close()
+            
+    # Active
+    st.subheader("Rastreadores")
     db = next(get_db())
     configs = db.query(SearchConfig).all()
-    if configs:
-        for c in configs:
-            col1, col2, col3 = st.columns([6, 2, 2])
-            with col1:
-                st.markdown(f"**{c.term or c.brand_name}**")
-                tags = []
-                if c.min_price or c.max_price: tags.append(f"{c.min_price}-{c.max_price}€")
-                if c.sizes: tags.append(f"Tallas: {c.sizes}")
-                st.caption(", ".join(tags))
-            with col2:
-                if st.button("🔄 Escanear", key=f"s_{c.id}"):
+    for c in configs:
+        with st.container(border=True):
+            cols = st.columns([5, 2, 1])
+            cols[0].markdown(f"**{c.term}** - {c.brand_name or 'Cualquier marca'}")
+            if cols[1].button("Escanear", key=f"s_{c.id}"):
+                with st.status(f"Escaneando {c.term}...", expanded=True) as status:
                     n = scrape_and_save(db, c)
-                    st.toast(f"{n} nuevos items")
-            with col3:
-                if st.button("🗑️", key=f"d_{c.id}"):
-                    db.delete(c)
-                    db.commit()
-                    st.rerun()
+                    status.update(label=f"Completado: {n} nuevos.", state="complete")
+            if cols[2].button("🗑️", key=f"d_{c.id}"):
+                db.delete(c)
+                db.commit()
+                st.rerun()
     
+    # Results
     st.divider()
-    
-    # Results Table
-    st.subheader("💎 Mercado en Tiempo Real")
-    products = db.query(Product).order_by(Product.scanned_at.desc()).limit(100).all()
-    
-    if products:
+    prods = db.query(Product).order_by(Product.scanned_at.desc()).limit(150).all()
+    if prods:
+        # Prepare for DataFrame
         data = []
-        for p in products:
-            img_path = p.image_url # Default remote
-            if p.local_image_path:
-                # Streamlit serves static files if configured, but for simpler docker usage we keep remote for table usually
-                # Or we can serve if we map static folder. For now, use remote for ease.
-                pass
-            
-            data.append({
-                "Foto": p.image_url,
-                "Producto": p.title,
-                "Precio": p.price,
-                "Talla": p.size,
-                "Marca": p.brand,
-                "Detectado": p.scanned_at,
-                "URL": p.url
-            })
-        
-        df = pd.DataFrame(data)
-        st.dataframe(
-            df,
-            column_config={
-                "Foto": st.column_config.ImageColumn(width="small"),
-                "URL": st.column_config.LinkColumn("Ir a Vinted"),
-                "Precio": st.column_config.NumberColumn(format="%.2f €"),
-                "Detectado": st.column_config.DatetimeColumn(format="HH:mm DD/MM")
-            },
-            hide_index=True,
-            use_container_width=True
-        )
+        for p in prods:
+             data.append({
+                 "Img": p.image_url, 
+                 "Producto": p.title, 
+                 "Precio": p.price, 
+                 "Marca": p.brand, 
+                 "URL": p.url,
+                 "Estado": "🔴 Vendido" if p.is_sold else "🟢 Disp."
+             })
+        st.dataframe(pd.DataFrame(data), column_config={"Img": st.column_config.ImageColumn(), "URL": st.column_config.LinkColumn()}, hide_index=True)
+    
     db.close()
 
-elif page == "🛠️ Configuración":
-    st.header("⚙️ Ajustes del Sistema")
+elif mode == "📈 Análisis de Mercado":
+    st.title("Inteligencia de Precios")
+    st.info("Analiza la evolución de precios y la distribución del mercado.")
+    
     db = next(get_db())
+    # Load all price history
+    history = pd.read_sql(db.query(PriceHistory).statement, db.bind)
+    products = pd.read_sql(db.query(Product).statement, db.bind)
+    
+    if not history.empty:
+        # Merge
+        full_df = pd.merge(history, products, left_on="product_id", right_on="id", suffixes=('_hist', '_prod'))
+        
+        # 1. Price Matrix
+        st.subheader("Matriz de Evolución")
+        pivot = full_df.pivot_table(index='title', columns=pd.to_datetime(full_df['timestamp']).dt.date, values='price_hist', aggfunc='last')
+        st.dataframe(pivot)
+        
+        # Export
+        if st.button("Descargar Excel"):
+            output = BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                pivot.to_excel(writer, sheet_name='Matriz')
+                full_df.to_excel(writer, sheet_name='RawData')
+            st.download_button("📥 Descargar .xlsx", output.getvalue(), "vinted_analisis.xlsx")
+            
+        # 2. Stats
+        st.subheader("Estadísticas de Mercado (Box Plot)")
+        # Filter by Search Config
+        terms = products['title'].unique() # Ideally search_config term, but title works for now
+        # Visualizing price distribution by Brand
+        if 'brand' in full_df.columns:
+            st.bar_chart(full_df.groupby('brand')['price_prod'].mean())
+            
+    else:
+        st.warning("No hay suficiente historial de precios.")
+    db.close()
+
+elif mode == "🚨 Reglas y Alertas":
+    st.header("Motor de Alertas")
+    st.info("Define reglas globales. Si un escaneo coincide, te llegará un mensaje.")
+    
+    with st.form("new_rule"):
+        name = st.text_input("Nombre de la Regla", placeholder="Ej: Gangas Nike")
+        brands = st.text_input("Marcas (separadas por coma)", placeholder="Nike, Adidas")
+        max_p = st.number_input("Precio Máximo", 0.0)
+        
+        if st.form_submit_button("Crear Regla"):
+            db = next(get_db())
+            db.add(AlertRule(name=name, brand_list=brands, max_price=max_p if max_p > 0 else None))
+            db.commit()
+            st.success("Regla creada.")
+            db.close()
+            
+    # List Rules
+    db = next(get_db())
+    rules = db.query(AlertRule).all()
+    for r in rules:
+        with st.container(border=True):
+            c1, c2 = st.columns([5, 1])
+            c1.markdown(f"**{r.name}** | Marcas: {r.brand_list} | Max: {r.max_price}€")
+            if c2.button("Borrar", key=f"rd_{r.id}"):
+                db.delete(r)
+                db.commit()
+                st.rerun()
+    db.close()
+
+elif mode == "🛠️ Configuración":
+    st.header("Configuración")
     
     # Telegram
-    st.subheader("🔔 Notificaciones Telegram")
-    curr_token = db.query(Config).filter_by(key="telegram_token").first()
-    curr_chat = db.query(Config).filter_by(key="telegram_chat_id").first()
-    
-    with st.form("tg_conf"):
-        t_token = st.text_input("Bot Token", value=curr_token.value if curr_token else "")
-        t_chat = st.text_input("Chat ID", value=curr_chat.value if curr_chat else "")
+    with st.expander("🔔 Telegram", expanded=True):
+        db = next(get_db())
+        current_token = db.query(Config).filter_by(key="telegram_token").first()
+        current_chat = db.query(Config).filter_by(key="telegram_chat_id").first()
         
-        if st.form_submit_button("Guardar Credenciales"):
-            # Upsert
-            def upsert(k, v):
-                obj = db.query(Config).filter_by(key=k).first()
-                if not obj: db.add(Config(key=k, value=v))
-                else: obj.value = v
-            
-            upsert("telegram_token", t_token)
-            upsert("telegram_chat_id", t_chat)
+        with st.form("tg"):
+            tk = st.text_input("Token", value=current_token.value if current_token else "")
+            cid = st.text_input("Chat ID", value=current_chat.value if current_chat else "")
+            if st.form_submit_button("Guardar"):
+                # Upsert logic simplified
+                if not current_token: db.add(Config(key="telegram_token", value=tk))
+                else: current_token.value = tk
+                if not current_chat: db.add(Config(key="telegram_chat_id", value=cid))
+                else: current_chat.value = cid
+                db.commit()
+                st.toast("Guardado")
+        db.close()
+
+    # Brand Sync
+    with st.expander("🏷️ Marcas Vinted"):
+        st.markdown("Sincroniza marcas populares para tener el autocompletado.")
+        keyword = st.text_input("Buscar marca para importar ID (ej: Nike)", value="Nike")
+        if st.button("Buscar e Importar"):
+            db = next(get_db())
+            found = fetch_vinted_brands(keyword)
+            count = 0
+            for b_data in found:
+                exists = db.query(Brand).filter_by(vinted_id=b_data['id']).first()
+                if not exists:
+                    db.add(Brand(vinted_id=b_data['id'], title=b_data['title']))
+                    count += 1
             db.commit()
-            st.success("Guardado.")
-            
-    if st.button("🔔 Probar Notificación"):
-        send_telegram_alert("✅ Prueba de configuración exitosa.")
-        st.toast("Mensaje de prueba enviado.")
+            st.success(f"Importadas {count} marcas nuevas.")
+            db.close()
 
-    st.divider()
-    
-    # Scheduler
-    st.subheader("⏱️ Frecuencia de Escaneo")
-    sch_active = db.query(Config).filter_by(key="scheduler_active").first()
-    sch_int = db.query(Config).filter_by(key="scheduler_interval").first()
-    
-    act = st.toggle("Scraper Automático Activo", value=(sch_active.value == "1") if sch_active else True)
-    inte = st.slider("Intervalo (Horas)", 1, 48, int(sch_int.value) if sch_int else 6)
-    
-    if st.button("Actualizar Tareas"):
-        def upsert(k, v):
-            obj = db.query(Config).filter_by(key=k).first()
-            if not obj: db.add(Config(key=k, value=v))
-            else: obj.value = v
-        
-        upsert("scheduler_active", "1" if act else "0")
-        upsert("scheduler_interval", str(inte))
-        db.commit()
-        
-        update_scheduler_job(db)
-        st.success("Planificador actualizado.")
-        
-    db.close()
-
-elif page == "🔍 Logs":
-    st.header("Registro del Sistema")
-    if st.button("Refrescar"): st.rerun()
-    
+elif mode == "🔍 Logs":
+    st.header("Logs en Vivo")
+    if st.button("Refresh"): st.rerun()
     db = next(get_db())
-    logs = db.query(ScraperLog).order_by(ScraperLog.timestamp.desc()).limit(100).all()
+    logs = db.query(ScraperLog).order_by(ScraperLog.timestamp.desc()).limit(50).all()
     for l in logs:
-        c = "red" if l.level == "ERROR" else "orange" if l.level == "WARNING" else "green"
-        st.markdown(f":{c}[[{l.timestamp.strftime('%H:%M:%S')}]] **{l.level}**: {l.message}")
+        st.caption(f"{l.timestamp.strftime('%H:%M:%S')} - {l.message}")
     db.close()

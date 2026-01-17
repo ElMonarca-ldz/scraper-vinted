@@ -284,6 +284,64 @@ def scrape_vinted(search_config):
     log_to_db(f"Búsqueda finalizada. {len(results)} items extraídos.", "INFO")
     return results
 
+def fetch_vinted_brands(keyword=""):
+    """
+    Scrapes Vinted API/Page to find brands matching a keyword.
+    Returns: List of dicts {'id': '123', 'title': 'Nike'}
+    """
+    brands = []
+    log_to_db(f"Buscando marcas: '{keyword}'", "INFO")
+    
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        # Use a context to keep cookies if needed, or just new page
+        page = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            locale="es-ES"
+        )
+        
+        try:
+            # Vinted hidden API for brands usually accessed via:
+            # https://www.vinted.es/api/v2/catalog/brands?search_text=nike
+            # But access is protected.
+            # Alternative: Scrape the HTML search if possible, or use a known public endpoint.
+            # Let's try navigating to the catalog page and intercepting the response or using a specific search page.
+            
+            # METHOD A: Use the autocomplete API endpoint (often easiest if cookies set)
+            page.goto("https://www.vinted.es", timeout=30000)
+            try: page.click('#onetrust-accept-btn-handler')
+            except: pass
+            
+            # Wait for session
+            time.sleep(2)
+            
+            # Direct API call via page context (to use auth/cookies)
+            # URL: /api/v2/catalog/brands?search_text={keyword}
+            api_url = f"https://www.vinted.es/api/v2/catalog/brands?search_text={keyword}" if keyword else "https://www.vinted.es/api/v2/catalog/brands"
+            
+            # JavaScript evaluation to fetch data
+            data = page.evaluate(f'''async () => {{
+                try {{
+                    const response = await fetch("{api_url}");
+                    return await response.json();
+                }} catch (e) {{
+                    return null;
+                }}
+            }}''')
+            
+            if data and 'brands' in data:
+                for b in data['brands']:
+                    brands.append({'id': str(b['id']), 'title': b['title']})
+            
+            log_to_db(f"Encontradas {len(brands)} marcas.", "INFO")
+            
+        except Exception as e:
+             log_to_db(f"Error buscando marcas: {e}", "ERROR")
+             
+        browser.close()
+        
+    return brands
+
 def verify_sold_status(product_url):
     """
     Checks a specific product URL to see if it's sold or deleted.
