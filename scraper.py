@@ -220,67 +220,117 @@ def scrape_vinted(search_config):
                         link_elem = item.query_selector('a') # Fallback
                         
                     if not link_elem: continue
-
-                    raw_url = link_elem.get_attribute('href')
-                    product_data['url'] = f"https{raw_url}" if raw_url.startswith('://') else (raw_url if raw_url.startswith('http') else f"https://www.vinted.es{raw_url}")
-                    product_data['title'] = link_elem.get_attribute('title') or "Sin título"
-                    
-                    # 2. Price (Looks for currency symbol text)
-                    # We iterate all text elements in the card to find the price pattern
-                    all_texts = item.inner_text().split('\n')
-                    price_found = 0.0
-                    for t in all_texts:
-                        if '€' in t:
-                            try:
-                                clean = t.replace('€', '').replace(' ', '').replace(',', '.')
-                                price_found = float(clean)
-                                break
-                            except: continue
-                    product_data['price'] = price_found
-
-                    # 3. Meta (Brand / Size)
-                    # Vinted structure: Use 'user-login-name' or specific classes usually.
-                    # Since classes change hash, we look for text structure. 
-                    # Usually: [Image] -> [Price] -> [Size] -> [Brand]
-                    # Or: [Image] -> [User] -> [Price] -> [Size] -> [Brand]
-                    
-                    # Heuristic: Brand is often capitalized text that is NOT the price.
-                    # Size is often XS, S, M, L, 38, 40 etc.
-                    
-                    # Let's try to infer from the text array we split earlier
-                    # Common Layout: [Price] [Size] [Brand]
-                    clean_texts = [x for x in all_texts if x.strip() and '€' not in x and 'anuncio' not in x.lower()]
-                    
-                    # Last element is often Brand, Second to last is Size. (Heuristic)
-                    if len(clean_texts) >= 2:
-                        product_data['brand'] = clean_texts[-1]
-                        product_data['size'] = clean_texts[-2]
-                    elif len(clean_texts) == 1:
-                        product_data['brand'] = clean_texts[0]
-                        product_data['size'] = "N/A"
-                    else:
-                        product_data['brand'] = "Desconocido"
-                        product_data['size'] = "N/A"
-
-                    # 4. Image
-                    img_elem = item.query_selector('img')
-                    if img_elem:
-                         product_data['image_url'] = img_elem.get_attribute('src')
-                         
-                    # Check for "Sold" markers
-                    # Vinted overlays a text when sold
-                    # product_data['is_sold'] = 1 if "vendido" in item.inner_text().lower() else 0
-
-                    results.append(product_data)
-                    
-                except Exception as e:
-                    continue
-                    
-        except Exception as e:
-            log_to_db(f"Error crítico scraping: {e}", "ERROR")
+            # --- PARSING AND PAGINATION ---
+            page_idx = 1
+            total_items = 0
             
-        browser.close()
-        
+            while True:
+                # Breaks if limits reached
+                if search_config.max_pages and page_idx > search_config.max_pages:
+                    log_to_db(f"Límite de páginas ({search_config.max_pages}) alcanzado.", "INFO")
+                    break
+                if search_config.max_items and total_items >= search_config.max_items:
+                    log_to_db(f"Límite de items ({search_config.max_items}) alcanzado.", "INFO")
+                    break
+
+                log_to_db(f"Procesando página {page_idx}...", "INFO")
+                
+                try:
+                    page.wait_for_selector('div[data-testid="grid-item"]', timeout=10000)
+                except Exception:
+                    log_to_db("No se encontraron más productos o fin de paginación.", "WARNING")
+                    break
+                
+                items = page.query_selector_all('div[data-testid="grid-item"]')
+                
+                if not items:
+                    break
+                    
+                for item in items:
+                    if search_config.max_items and total_items >= search_config.max_items: break
+                    
+                    try:
+                        # --- ROBUST PARSING STRATEGY ---
+                        # Title: looking for specific header or class to avoid polluting with price
+                        # Usually it is inside a hierarchy. Let's find the product info container.
+                        title_cand = ""
+                        
+                        # Strategy 1: specific data-testid
+                        title_el = item.query_selector('[data-testid*="title"]')
+                        if title_el:
+                            title_cand = title_el.inner_text().strip()
+                        else:
+                            # Strategy 2: second text block usually (after user info)
+                            # This is risky, let's try finding the link which usually contains the title in aria-label or within
+                            link_el = item.query_selector('a[data-testid="item-box-overlay"]') or item.query_selector('a')
+                            if link_el:
+                                title_cand = link_el.get_attribute('title') or ""
+                        
+                        # Fallback clean-up if title still looks messy
+                        # Remove price patterns if accidentally caught
+                        if "€" in title_cand:
+                            # Heuristic: split by newline and take valid part? 
+                            # If parser failed, we might use the image alt text
+                            img = item.query_selector('img')
+                            if img: title_cand = img.get_attribute('alt') or title_cand
+
+                        url_el = item.query_selector('a')
+                        url = url_el.get_attribute('href') if url_el else None
+                        
+                        # Price
+                        price_str = "0.0"
+                        # Try finding element with price text content
+                        # Vinted prices format: "10,00 €"
+                        text_content = item.inner_text()
+                        # Regex filter for price might be safer than selecting random divs
+                        import re
+                        price_match = re.search(r'(\d+[,.]\d{2})\s?€?', text_content)
+                        if price_match:
+                            price_str = price_match.group(1).replace(',', '.')
+                        
+                        # Brand (often hidden or in specific footer)
+                        brand = item.query_selector('p[data-testid="grid-item-subtitle"]') # Common for brand/size
+                        brand_txt = brand.inner_text() if brand else "Desconocida"
+                        
+                        # Size (sometimes mixed with brand)
+                        size_txt = "N/A"
+                        # Try to parse from subtitle if format is "Brand / Size"
+                        
+                        if url:
+                            if not url.startswith("http"): url = f"https://www.vinted.es{url}"
+                            
+                            results.append({
+                                'title': title_cand,
+                                'price': float(price_str) if price_str else 0.0,
+                                'url': url,
+                                'image_url': item.query_selector('img').get_attribute('src') if item.query_selector('img') else None,
+                                'brand': brand_txt,
+                                'size': size_txt
+                            })
+                            total_items += 1
+                            
+                    except Exception as e:
+                        continue
+                
+                # Next Page logic
+                page_idx += 1
+                try:
+                    # Generic next button check or URL manipulation
+                    # Vinted usually uses URL params, so we can check if "Next" button exists
+                    next_btn = page.query_selector('a[data-testid="pagination-next-button"]');
+                    if not next_btn or "disabled" in next_btn.get_attribute('class'):
+                         break
+                    next_btn.click()
+                    page.wait_for_timeout(3000) # Wait for load
+                    # Alternatively, update URL param logic if loop handles goto
+                except:
+                    break
+            
+            browser.close()
+            
+    except Exception as e:
+        log_to_db(f"Error crítico en scraper: {e}", "ERROR")
+
     log_to_db(f"Búsqueda finalizada. {len(results)} items extraídos.", "INFO")
     return results
 

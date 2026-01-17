@@ -191,8 +191,20 @@ if mode == "📊 Dashboard":
             min_p = c1.number_input("Min €", 0.0)
             max_p = c2.number_input("Max €", 0.0)
             
+            # Limits
+            c3, c4 = st.columns(2)
+            lim_pages = c3.number_input("Máx Páginas", 1, 50, 5, help="Cuántas páginas de Vinted recorrer.")
+            lim_items = c4.number_input("Máx Items", 10, 1000, 100, help="Detener tras encontrar N items.")
+            
             if st.form_submit_button("Guardar"):
-                nc = SearchConfig(term=term, brand_name=brand_val, min_price=min_p, max_price=max_p if max_p > 0 else None)
+                nc = SearchConfig(
+                    term=term, 
+                    brand_name=brand_val, 
+                    min_price=min_p, 
+                    max_price=max_p if max_p > 0 else None,
+                    max_pages=lim_pages,
+                    max_items=lim_items
+                )
                 db.add(nc)
                 db.commit()
                 st.success("Guardado")
@@ -206,9 +218,10 @@ if mode == "📊 Dashboard":
     for c in configs:
         with st.container(border=True):
             cols = st.columns([5, 2, 1])
-            cols[0].markdown(f"**{c.term}** - {c.brand_name or 'Cualquier marca'}")
+            cols[0].markdown(f"**{c.term}** - {c.brand_name or 'Cualquier marca'} | 📄 {c.max_pages} pgs")
             if cols[1].button("Escanear", key=f"s_{c.id}"):
                 with st.status(f"Escaneando {c.term}...", expanded=True) as status:
+                    status.write("Iniciando navegador...")
                     n = scrape_and_save(db, c)
                     status.update(label=f"Completado: {n} nuevos.", state="complete")
             if cols[2].button("🗑️", key=f"d_{c.id}"):
@@ -218,6 +231,30 @@ if mode == "📊 Dashboard":
     
     # Results
     st.divider()
+    st.subheader("Últimos Hallazgos")
+    
+    # BATCH DELETE FUNCTION
+    with st.expander("🗑️ Gestión de Lotes (Borrado Masivo)"):
+        # Group products by scanned_at (minute precision)
+        # SQLite dialect for date truncation equivalent
+        # For simplicity, we fetch distinct scanned_at and count
+        dates = db.query(Product.scanned_at).distinct().order_by(Product.scanned_at.desc()).limit(20).all()
+        # Flatten
+        unique_dates = sorted(list(set([d[0].strftime("%Y-%m-%d %H:%M") for d in dates])), reverse=True)
+        
+        target_batch = st.selectbox("Seleccionar Lote (Fecha/Hora)", unique_dates, index=None)
+        if target_batch and st.button(f"Eliminar items de {target_batch}"):
+            # Parse back
+            # Deleting by string match on strftime is tricky in SQL directly without specific func
+            # Let's do a range check (Minute start to Minute end)
+            dt_start = datetime.strptime(target_batch, "%Y-%m-%d %H:%M")
+            dt_end = dt_start + timedelta(minutes=1)
+            
+            deleted = db.query(Product).filter(Product.scanned_at >= dt_start, Product.scanned_at < dt_end).delete()
+            db.commit()
+            st.success(f"Eliminados {deleted} productos del lote {target_batch}.")
+            st.rerun()
+
     prods = db.query(Product).order_by(Product.scanned_at.desc()).limit(150).all()
     if prods:
         # Prepare for DataFrame
@@ -226,7 +263,7 @@ if mode == "📊 Dashboard":
              data.append({
                  "Img": p.image_url, 
                  "Producto": p.title, 
-                 "Precio": p.price, 
+                 "Precio": f"{p.price} €", 
                  "Marca": p.brand, 
                  "URL": p.url,
                  "Estado": "🔴 Vendido" if p.is_sold else "🟢 Disp."
@@ -245,12 +282,24 @@ elif mode == "📈 Análisis de Mercado":
     products = pd.read_sql(db.query(Product).statement, db.bind)
     
     if not history.empty:
-        # Merge
         full_df = pd.merge(history, products, left_on="product_id", right_on="id", suffixes=('_hist', '_prod'))
         
+        # FILTERS
+        st.subheader("Filtros")
+        f_c1, f_c2 = st.columns(2)
+        all_brands = sorted(full_df['brand'].astype(str).unique())
+        sel_brand = f_c1.multiselect("Filtrar Marca", all_brands)
+        sel_term = f_c2.text_input("Filtrar en Título")
+        
+        filtered_df = full_df.copy()
+        if sel_brand:
+            filtered_df = filtered_df[filtered_df['brand'].isin(sel_brand)]
+        if sel_term:
+            filtered_df = filtered_df[filtered_df['title'].str.contains(sel_term, case=False, na=False)]
+            
         # 1. Price Matrix
-        st.subheader("Matriz de Evolución")
-        pivot = full_df.pivot_table(index='title', columns=pd.to_datetime(full_df['timestamp']).dt.date, values='price_hist', aggfunc='last')
+        st.subheader(f"Matriz de Evolución ({len(filtered_df)} registros)")
+        pivot = filtered_df.pivot_table(index='title', columns=pd.to_datetime(filtered_df['timestamp']).dt.date, values='price_hist', aggfunc='last')
         st.dataframe(pivot)
         
         # Export
@@ -258,16 +307,13 @@ elif mode == "📈 Análisis de Mercado":
             output = BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
                 pivot.to_excel(writer, sheet_name='Matriz')
-                full_df.to_excel(writer, sheet_name='RawData')
+                filtered_df.to_excel(writer, sheet_name='RawData')
             st.download_button("📥 Descargar .xlsx", output.getvalue(), "vinted_analisis.xlsx")
             
         # 2. Stats
         st.subheader("Estadísticas de Mercado (Box Plot)")
-        # Filter by Search Config
-        terms = products['title'].unique() # Ideally search_config term, but title works for now
-        # Visualizing price distribution by Brand
-        if 'brand' in full_df.columns:
-            st.bar_chart(full_df.groupby('brand')['price_prod'].mean())
+        if 'brand' in filtered_df.columns:
+            st.bar_chart(filtered_df.groupby('brand')['price_prod'].mean())
             
     else:
         st.warning("No hay suficiente historial de precios.")

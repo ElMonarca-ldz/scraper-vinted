@@ -76,19 +76,23 @@ class SearchConfig(Base):
     __tablename__ = 'search_configs'
     
     id = Column(Integer, primary_key=True)
-    term = Column(String, nullable=True) # Term can be optional if filter-only search
-    min_price = Column(Float, nullable=True)
-    max_price = Column(Float, nullable=True)
-    sizes = Column(String, nullable=True) 
-    condition = Column(String, nullable=True)
-    # New Advanced Filters
-    color_ids = Column(String, nullable=True)
-    catalog_ids = Column(String, nullable=True)
-    brand_name = Column(String, nullable=True)
+    term = Column(String)
+    brand_name = Column(String) # Text filter or DB synced name
+    min_price = Column(Float)
+    max_price = Column(Float)
+    sizes = Column(String) # Comma separated IDs
+    condition = Column(String)
+    color_ids = Column(String)
+    catalog_ids = Column(String)
     
-    last_run = Column(DateTime, nullable=True)
+    # Limits
+    max_pages = Column(Integer, default=5)
+    max_items = Column(Integer, default=100)
     
-    products = relationship("Product", back_populates="search_config", cascade="all, delete-orphan")
+    last_run = Column(DateTime)
+    last_check_sold = Column(DateTime)
+    
+    products = relationship("Product", back_populates="config", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<SearchConfig(term='{self.term}')>"
@@ -139,10 +143,15 @@ def init_db():
             conn.execute(text("ALTER TABLE search_configs ADD COLUMN catalog_ids VARCHAR"))
         if 'brand_name' not in sc_columns:
             conn.execute(text("ALTER TABLE search_configs ADD COLUMN brand_name VARCHAR"))
-        conn.commit()
-            
-    # 2. Product Migrations
-    p_columns = [c['name'] for c in inspector.get_columns('products')]
+        
+        # Phase 3 Limits
+        if 'max_pages' not in sc_columns:
+            conn.execute(text("ALTER TABLE search_configs ADD COLUMN max_pages INTEGER DEFAULT 5"))
+        if 'max_items' not in sc_columns:
+            conn.execute(text("ALTER TABLE search_configs ADD COLUMN max_items INTEGER DEFAULT 100"))
+        
+        # 2. Product Migrations
+        p_columns = [c['name'] for c in inspector.get_columns('products')]
     
     with engine.connect() as conn:
         if 'local_image_path' not in p_columns:
