@@ -149,6 +149,8 @@ def init_db():
             conn.execute(text("ALTER TABLE search_configs ADD COLUMN max_pages INTEGER DEFAULT 5"))
         if 'max_items' not in sc_columns:
             conn.execute(text("ALTER TABLE search_configs ADD COLUMN max_items INTEGER DEFAULT 100"))
+        if 'last_check_sold' not in sc_columns:
+            conn.execute(text("ALTER TABLE search_configs ADD COLUMN last_check_sold DATETIME"))
         
         # 2. Product Migrations
         p_columns = [c['name'] for c in inspector.get_columns('products')]
