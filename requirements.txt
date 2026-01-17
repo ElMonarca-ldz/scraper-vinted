@@ -4,4 +4,6 @@ pandas==2.2.0
 sqlalchemy==2.0.25
 apscheduler==3.10.4
 watchdog==3.0.0
-openpyxl
+requests
+Pillow==10.2.0
+pillow-avif-plugin==1.4.3
