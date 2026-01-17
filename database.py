@@ -92,7 +92,7 @@ class SearchConfig(Base):
     last_run = Column(DateTime)
     last_check_sold = Column(DateTime)
     
-    products = relationship("Product", back_populates="config", cascade="all, delete-orphan")
+    products = relationship("Product", back_populates="search_config", cascade="all, delete-orphan")
 
     def __repr__(self):
         return f"<SearchConfig(term='{self.term}')>"
